@@ -1,151 +1,132 @@
-from typing import TypedDict, Annotated, Optional, List
-import operator
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from dotenv import load_dotenv
+from typing import TypedDict, Literal
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool
 from langchain_groq import ChatGroq
-
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from dotenv import load_dotenv
 
 load_dotenv()
 
-class AgentState(TypedDict):
-    """
-    The state object that gts passed between all nodes.
-    Each node can read from and update these fields.
-    """
 
-    # Messages between user and agent  (accumulates with operator.add)
-    messages: Annotated[List[BaseMessage], operator.add]
-
-    # The original user query
-    user_query: str
-
-    # Track which route we took
-    route_taken: str
-
-    # Results from different sources
-    weather_result: Optional[str]
-    calculator_result: Optional[str]
-    datetime_result: Optional[str]
-    tavily_result: Optional[str]
-
-    final_answer: str
-
-llm = ChatGroq(
-    model="llama-3.1-70b-versatile",
-    temperature=0
-)
+# 1. STATE
+class State(TypedDict):
+    messages: list
 
 
-
-def router_node(state: AgentState)-> AgentState:
-    """
-    Router Node: Analyzes the user query and decides which tool/path to take.
-    """
-    user_query = state["user_query"].lower()
-
-    if any(word in user_query for word in ["weather", "temperature", "forecast","rain","sunny"]):
-        route = "weather"
-    elif any(word in user_query for word in ["calculate", "convert", "plus", "minus", "multiply", "divide", "%"]):
-        route = "calculator"
-    elif any(word in user_query for word in ["time", "date", "timezone", "what day", "current time"]):
-        route = "datetime"
-    else:
-        route = "tavily"
-    print(f" -> Routing to: {route.upper()}")
-
-
-    # Update state with the route decision
-    return {
-        "route_taken": route,
-        "messages": [SystemMessage(content=f"Routing query to {route} handler")]
+# 2. DEFINE TOOLS - LLM will see these and choose what to use
+@tool
+def get_weather(city: str) -> str:
+    """Get current weather for a city. Use this when user asks about weather or temperature."""
+    weather_db = {
+        "accra": "28°C, Sunny",
+        "london": "15°C, Cloudy",
+        "lagos": "30°C, Hot",
+        "paris": "18°C, Rainy"
     }
+    return weather_db.get(city.lower(), f"Weather data not available for {city}")
 
 
-def weather_node(state: AgentState) -> AgentState:
-    """
-    Weather Node: Fetches real weather data for a city
-    Uses openWeatherMap API
-    """
-    user_query = state["user_query"]
+@tool
+def calculate(expression: str) -> str:
+    """Perform mathematical calculations. Use when user asks to calculate or do math."""
+    try:
+        result = eval(expression)
+        return f"The answer is {result}"
+    except Exception as e:
+        return f"Cannot calculate: {str(e)}"
 
-    query_lower = user_query.lower()
 
-    city = None
-    if " in " in query_lower:
-        parts = query_lower.split(" in ")
-        if len(parts) > 1:
-            city = parts[1].split()[0].strip('?.,!')
-    elif " for " in query_lower:
-        parts = query_lower.split(" for ")
-        if len(parts) > 1:
-            city =parts[1].split()[0].strip('?.,!')
-    else:
-        words = query_lower.split()
-        for word in reversed(words):
-            if word not in ["weather", "temperature"]:
-                city = word.strip('?.,!')
-            break
+@tool
+def search_web(query: str) -> str:
+    """Search the web for current information. Use this for general questions, facts, or anything not covered by other tools."""
+    # THIS IS WHERE TAVILY WOULD GO
+    # For now, mock response
+    return f"Search results for '{query}': This is where Tavily would return real web results about your question."
 
-    if not city:
-        return {
-            "weather_result": "Could not identify city",
-            "messages": [SystemMessage(content="Failed to to extract city name")]
+
+# 3. BIND TOOLS TO LLM - This is the injection!
+tools = [get_weather, calculate, search_web]
+llm = ChatGroq(model="llama-3.1-70b-versatile", temperature=0)
+llm_with_tools = llm.bind_tools(tools)  # <-- THE MAGIC HAPPENS HERE
+
+
+# 4. AGENT NODE - LLM decides which tool to call
+def agent(state: State) -> State:
+    """The LLM looks at the query and decides: call a tool or respond directly"""
+    messages = state["messages"]
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
+
+
+# 5. ROUTER - Check if LLM wants to use tools or is done
+def should_continue(state: State) -> Literal["tools", "end"]:
+    """If LLM called a tool, go to tools node. Otherwise end."""
+    last_message = state["messages"][-1]
+
+    # If LLM made tool calls, execute them
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+
+    # Otherwise we're done
+    return "end"
+
+
+# 6. BUILD GRAPH
+def create_graph():
+    workflow = StateGraph(State)
+
+    # Create tool node that executes whatever tool the LLM chose
+    tool_node = ToolNode(tools)
+
+    # Add nodes
+    workflow.add_node("agent", agent)
+    workflow.add_node("tools", tool_node)
+
+    # Start with agent
+    workflow.set_entry_point("agent")
+
+    # After agent, check if we need tools or are done
+    workflow.add_conditional_edges(
+        "agent",
+        should_continue,
+        {
+            "tools": "tools",
+            "end": END
         }
-    print(f" -> Detected city: {city.capitalize()}")
-
-    mock_weather_data = {
-        "london": {"temp": 15, "condition": "Cloudy", "humidity": 75},
-        "paris": {"temp": 18, "condition": "Sunny", "humidity": 60},
-        "tokyo": {"temp": 22, "condition": "Clear", "humidity": 55},
-        "new york": {"temp": 12, "condition": "Rainy", "humidity": 80},
-        "ghana": {"temp": 28, "condition": "Partly Cloudy", "humidity": 70},
-        "accra": {"temp": 28, "condition": "Hot and Humid", "humidity": 75},
-        "nigeria": {"temp": 30, "condition": "Sunny", "humidity": 65},
-        "lagos": {"temp": 29, "condition": "Humid", "humidity": 80},
-    }
-
-    weather = mock_weather_data.get(city.lower(), {"temp": 20, "condition": "Clear", "humidity": 50})
-    weather_result = (
-        f"Weather in {city.capitalize()}: "
-        f"{weather['temp']}°C, {weather['condition']}, "
-        f"Humidity: {weather['humidity']}%"
     )
 
-    print(f"   -> {weather_result}")
-    return {
-        "weather_result": weather_result,
-        "messages": [SystemMessage(content=f"weather data retrieved for {city}")]
-    }
+    # After tools execute, go back to agent to respond with results
+    workflow.add_edge("tools", "agent")
+
+    return workflow.compile()
 
 
+# 7. RUN IT
+if __name__ == "__main__":
+    app = create_graph()
 
-
-if __name__ == '__main__':
-    weather_queries = [
-        "What's is the weather in Ghana?",
-        "Convert 75 fahrenheit to Celsius",
-        "What time is it in Nigeria?",
-        "5 star hotels in Ghana",
-        "What is the population of Nigeria"
+    test_queries = [
+        "What's the weather in Lagos?",
+        "Calculate 100 + 250",
+        "Who is the president of Ghana?",  # Will use search_web (Tavily fallback)
+        "What is 5 times 8?"
     ]
 
-    for query in weather_queries:
-        print(f"\nQuery: '{query}'")
+    for query in test_queries:
+        print(f"\n{'=' * 60}")
+        print(f"Query: {query}")
+        print(f"{'=' * 60}")
 
-        test_state = AgentState(
-            messages = [],
-            user_query = query,
-            route_taken="weather",
-            weather_result=None,
-            calculator_result=None,
-            datetime_result=None,
-            tavily_result=None,
-            final_answer=''
-        )
+        result = app.invoke({
+            "messages": [HumanMessage(content=query)]
+        })
 
-        routed = router_node(test_state)
-        print(f"Route : {routed['route_taken']}")
+        # Print the final answer
+        final_message = result["messages"][-1]
+        print(f"Answer: {final_message.content}")
 
-        if routed['route_taken'] == 'weather':
-            result = weather_node((test_state))
-            print(f" Result:  {result['weather_result']}")
+        # Show which tool was used (if any)
+        for msg in result["messages"]:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                print(f"Tool used: {msg.tool_calls[0]['name']}")
